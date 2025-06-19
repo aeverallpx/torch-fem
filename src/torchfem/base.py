@@ -17,6 +17,8 @@ class FEM(ABC):
         self.nodes = nodes
         self.elements = elements
 
+        self.k_indices = None  # Cached indices for stiffness matrix assembly
+
         # Compute problem size
         self.n_dofs = torch.numel(self.nodes)
         self.n_nod = nodes.shape[0]
@@ -30,7 +32,7 @@ class FEM(ABC):
 
         # Compute mapping from local to global indices
         idx = (self.n_dim * self.elements).unsqueeze(-1) + torch.arange(self.n_dim)
-        self.idx = idx.reshape(self.n_elem, -1).to(torch.int32)
+        self._idx = idx.reshape(self.n_elem, -1).to(torch.int32)
 
         # Vectorize material
         if material.is_vectorized:
@@ -82,6 +84,20 @@ class FEM(ABC):
         if value.dtype != torch.bool:
             raise TypeError("Constraints must be a boolean tensor.")
         self._constraints = value.to(self.nodes.device)
+        # If constraints are set/changed, invalidate cached indices
+        self.k_indices = None
+
+    @property
+    def idx(self) -> Tensor:
+        """Return the indices of mesh elements."""
+        return self._idx
+
+    @idx.setter
+    def idx(self, value):
+        """Setter method - called whenever x is assigned"""
+        self._idx = value
+        # If indices are set/changed, invalidate cached indices
+        self.k_indices = None
 
     @abstractmethod
     def eval_shape_functions(
@@ -226,7 +242,7 @@ class FEM(ABC):
         K = torch.empty(size, layout=torch.sparse_coo)
 
         # Build matrix in chunks to prevent excessive memory usage
-        chunks = 4
+        chunks = 1
         for idx, k_chunk in zip(torch.chunk(self.idx, chunks), torch.chunk(k, chunks)):
             # Ravel indices and values
             chunk_size = idx.shape[0]
@@ -252,6 +268,78 @@ class FEM(ABC):
             K += torch.sparse_coo_tensor(indices, values, size=size).coalesce()
 
         return K.coalesce()
+
+    def get_k_indices(self) -> Tensor:
+        if self.k_indices:
+            return self.k_indices
+
+        size = (self.n_dofs, self.n_dofs)
+
+        # Build matrix in chunks to prevent excessive memory usage
+        idx = self.idx
+
+        # Ravel indices and values
+        col = idx.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        row = idx.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        indices = torch.stack([row, col], dim=0)
+
+        # Eliminate and replace constrained dofs
+        con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
+        ci = torch.isin(idx, con)
+        mask_col = (
+            ci.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        )
+        mask_row = (
+            ci.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        )
+        mask = ~(mask_col | mask_row)
+        diag_index = torch.stack((con, con), dim=0)
+
+        # Concatenate
+        indices = torch.cat((indices[:, mask], diag_index), dim=1)
+
+        # Sort by row then column for efficient summation
+        linear_indices = indices[0] * size[1] + indices[1]
+        sorted_idx = torch.argsort(linear_indices)
+        sorted_indices = indices[:, sorted_idx]
+
+        # Use torch.unique to sum duplicates
+        unique_linear_idx, inverse_indices = torch.unique(
+            sorted_indices[0] * size[1] + sorted_indices[1], return_inverse=True
+        )
+        self.k_indices = (unique_linear_idx, inverse_indices, sorted_idx, mask)
+
+        return self.k_indices
+
+    def assemble_stiffness_fast(
+        self, k: Tensor, constraint_values: Tensor
+    ) -> torch.sparse.Tensor:
+        """Assemble global stiffness matrix using fast method."""
+        size = (self.n_dofs, self.n_dofs)
+
+        unique_linear_idx, inverse_indices, sorted_idx, constraint_mask = (
+            self.get_k_indices()
+        )
+
+        # Get sorted values
+        values = torch.cat((k.ravel()[constraint_mask], constraint_values), dim=0)
+        sorted_values = values[sorted_idx]
+
+        summed_values = torch.zeros(
+            len(unique_linear_idx), dtype=k.dtype, device=k.device
+        )
+        summed_values.scatter_add_(0, inverse_indices, sorted_values)
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack(
+            [unique_linear_idx // size[1], unique_linear_idx % size[1]]
+        )
+
+        K = torch.sparse_coo_tensor(
+            unique_indices, summed_values, size=size, is_coalesced=True
+        )
+
+        return K
 
     def assemble_force(self, f: Tensor) -> Tensor:
         """Assemble global force vector."""
@@ -345,7 +433,9 @@ class FEM(ABC):
 
                 # Assemble global stiffness matrix and internal force vector (if needed)
                 if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
-                    self.K = self.assemble_stiffness(k, con)
+                    # self.K = self.assemble_stiffness(k, con)
+                    constraint_values = torch.ones_like(con, dtype=k.dtype)
+                    self.K = self.assemble_stiffness_fast(k, constraint_values)
                 F_int = self.assemble_force(f_i)
 
                 # Compute residual
@@ -359,7 +449,9 @@ class FEM(ABC):
 
                 # Print iteration information
                 if verbose:
-                    print(f"Increment {n} | Iteration {i+1} | Residual: {res_norm:.5e}")
+                    print(
+                        f"Increment {n} | Iteration {i + 1} | Residual: {res_norm:.5e}"
+                    )
 
                 # Check convergence
                 if res_norm < rtol * res_norm0 or res_norm < atol:
