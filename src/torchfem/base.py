@@ -322,11 +322,12 @@ class FEM(ABC):
         )
 
         # Compute element stiffness matrix
+        k = torch.zeros((self.n_elem, self.n_dim * N_nod, self.n_dim * N_nod))
         if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
             # Material stiffness
             detJBCB = torch.einsum("nijpq,mnqk,mnil->mnljkp", ddsdde, detJB, B)
             detJBCB = detJBCB.reshape(N_nod, -1, self.n_dim * N_nod, self.n_dim * N_nod)
-            k = torch.einsum(
+            k += torch.einsum(
                 "i, ijkl -> jkl", weights, self.compute_k_from_detJBCB(detJBCB)
             )
         if nlgeom:
@@ -564,6 +565,7 @@ class FEM(ABC):
         return_intermediate: bool = False,
         aggregate_integration_points: bool = True,
         use_cached_solve: bool = False,
+        use_cached_indices: bool = False,
         nlgeom: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Solve the FEM problem with the Newton-Raphson method.
@@ -624,16 +626,24 @@ class FEM(ABC):
             for i in range(max_iter):
                 du[con] = DU[con]
 
-                # Element-wise integration
-                k, f_i = self.integrate_material(
-                    u, defgrad, stress, state, n, du, de0, nlgeom
-                )
+                if not use_cached_indices:
+                    # Element-wise integration
+                    k, f_i = self.integrate_material(
+                        u, defgrad, stress, state, n, du, de0, nlgeom
+                    )
+                    # Assemble global stiffness matrix and internal force vector (if needed)
+                    if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                        self.K = self.assemble_stiffness(k, con)
+                else:
+                    # Element-wise integration
+                    k, f_i = self.integrate_material_fast(
+                        u, defgrad, stress, state, n, du, de0, nlgeom
+                    )
+                    # Assemble global stiffness matrix and internal force vector (if needed)
+                    if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                        constraint_values = torch.ones_like(con, dtype=k.dtype)
+                        self.K = self.assemble_stiffness_fast(k, constraint_values)
 
-                # Assemble global stiffness matrix and internal force vector (if needed)
-                if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
-                    # self.K = self.assemble_stiffness(k, con)
-                    constraint_values = torch.ones_like(con, dtype=k.dtype)
-                    self.K = self.assemble_stiffness_fast(k, constraint_values)
                 F_int = self.assemble_force(f_i)
 
                 # Compute residual
