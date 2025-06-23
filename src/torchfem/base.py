@@ -348,7 +348,7 @@ class FEM(ABC):
         size = (self.n_dofs, self.n_dofs)
 
         # Build matrix in chunks to prevent excessive memory usage
-        idx = self.idx
+        idx = self.idx.to(torch.int64)
 
         # Ravel indices and values
         col = idx.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
