@@ -269,6 +269,78 @@ class FEM(ABC):
 
         return K.coalesce()
 
+    def get_k_indices_no_constraints(self) -> Tensor:
+        if self.k_indices:
+            return self.k_indices
+
+        size = (self.n_dofs, self.n_dofs)
+
+        # Build matrix in chunks to prevent excessive memory usage
+        idx = self.idx.to(torch.int64)
+
+        # Ravel indices and values
+        col = idx.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        row = idx.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        indices = torch.stack([row, col], dim=0)
+
+        # Sort by row then column for efficient summation
+        linear_indices = indices[0] * size[1] + indices[1]
+        sorted_idx = torch.argsort(linear_indices)
+        sorted_indices = indices[:, sorted_idx]
+
+        # Use torch.unique to sum duplicates
+        unique_linear_idx, inverse_indices = torch.unique(
+            sorted_indices[0] * size[1] + sorted_indices[1], return_inverse=True
+        )
+        self.k_indices = (unique_linear_idx, inverse_indices, sorted_idx)
+
+        return self.k_indices
+
+    def assemble_stiffness_fast_no_constraint_cache(
+        self, k: Tensor
+    ) -> torch.sparse.Tensor:
+        """Assemble global stiffness matrix using fast method."""
+        size = (self.n_dofs, self.n_dofs)
+
+        unique_linear_idx, inverse_indices, sorted_idx = (
+            self.get_k_indices_no_constraints()
+        )
+
+        # Get summed values over indices
+        values = k.ravel()[sorted_idx]
+        summed_values = torch.zeros(
+            len(unique_linear_idx), dtype=k.dtype, device=k.device
+        )
+        summed_values.scatter_add_(0, inverse_indices, values)
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack(
+            [unique_linear_idx // size[1], unique_linear_idx % size[1]]
+        )
+
+        # Eliminate and replace constrained dofs
+        con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
+        mask = ~(
+            torch.isin(unique_linear_idx // size[1], con)
+            | torch.isin(unique_linear_idx % size[1], con)
+        )
+        diag_index = torch.stack((con, con), dim=0)
+        indices = torch.cat(
+            (unique_linear_idx[mask], diag_index[0] * size[1] + diag_index[1])
+        )
+        values = torch.cat(
+            (summed_values[mask], torch.ones_like(con, dtype=k.dtype, device=k.device))
+        )
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack([indices // size[1], indices % size[1]])
+
+        K = torch.sparse_coo_tensor(
+            unique_indices, values, size=size, is_coalesced=True
+        )
+
+        return K
+
     def get_k_indices(self) -> Tensor:
         if self.k_indices:
             return self.k_indices
