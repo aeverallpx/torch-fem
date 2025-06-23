@@ -473,7 +473,7 @@ class FEM(ABC):
 
         size = (self.n_dofs, self.n_dofs)
 
-        # Build matrix in chunks to prevent excessive memory usage
+        # TODO: automatically infer required integer dtype for size[0] * size[1]
         idx = self.idx.to(torch.int64)
 
         # Ravel indices and values
