@@ -14,11 +14,14 @@ class FEM(ABC):
         """Initialize a general FEM problem."""
 
         # Store nodes and elements
-        self.nodes = nodes
-        self.elements = elements
+        self._nodes = nodes
+        self._elements = elements
+
+        self.k_indices = None  # Cached indices for stiffness matrix assembly
+        self.B_matrices = None  # Cached B matrices for shape functions
 
         # Compute problem size
-        self.n_dofs = torch.numel(self.nodes)
+        self.n_dofs = torch.numel(nodes)
         self.n_nod = nodes.shape[0]
         self.n_dim = nodes.shape[1]
         self.n_elem = len(self.elements)
@@ -30,7 +33,7 @@ class FEM(ABC):
 
         # Compute mapping from local to global indices
         idx = (self.n_dim * self.elements).unsqueeze(-1) + torch.arange(self.n_dim)
-        self.idx = idx.reshape(self.n_elem, -1).to(torch.int32)
+        self._idx = idx.reshape(self.n_elem, -1).to(torch.int32)
 
         # Vectorize material
         if material.is_vectorized:
@@ -82,6 +85,45 @@ class FEM(ABC):
         if value.dtype != torch.bool:
             raise TypeError("Constraints must be a boolean tensor.")
         self._constraints = value.to(self.nodes.device)
+        # If constraints are set/changed, invalidate cached indices
+        self.k_indices = None
+
+    @property
+    def elements(self) -> Tensor:
+        """Return the elements of the mesh."""
+        return self._elements
+
+    @elements.setter
+    def elements(self, value: Tensor):
+        """Setter method - called whenever elements are assigned"""
+        # If elements are set/changed, invalidate cached indices
+        self.k_indices = None
+        self.B_matrices = None
+
+    @property
+    def nodes(self) -> Tensor:
+        """Return the nodes of the mesh."""
+        return self._nodes
+
+    @nodes.setter
+    def nodes(self, value: Tensor):
+        """Setter method - called whenever nodes are assigned"""
+        self._nodes = value.to(self.nodes.device)
+        # If nodes are set/changed, invalidate cached indices
+        self.k_indices = None
+        self.B_matrices = None
+
+    @property
+    def idx(self) -> Tensor:
+        """Return the indices of mesh elements."""
+        return self._idx
+
+    @idx.setter
+    def idx(self, value):
+        """Setter method - called whenever x is assigned"""
+        self._idx = value
+        # If indices are set/changed, invalidate cached indices
+        self.k_indices = None
 
     @abstractmethod
     def eval_shape_functions(
@@ -91,6 +133,10 @@ class FEM(ABC):
 
     @abstractmethod
     def compute_k(self, detJ: Tensor, BCB: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def compute_k_from_detJBCB(self, detJBCB: Tensor) -> Tensor:
         raise NotImplementedError
 
     @abstractmethod
@@ -203,6 +249,103 @@ class FEM(ABC):
 
         return k, f
 
+    def get_B(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Compute the gradient operators for the element."""
+
+        if self.B_matrices:
+            return self.B_matrices
+
+        points = self.etype.ipoints()
+        shape_functions = [self.eval_shape_functions(xi) for xi in points]
+        B0 = torch.stack([sf[1] for sf in shape_functions], dim=0)
+        detJ0 = torch.stack([sf[2] for sf in shape_functions], dim=0)
+        # Use initial gradient operators
+        B = B0
+        detJ = detJ0
+
+        detJB = torch.einsum("...,...jk->...jk", detJ, B)
+
+        self.B_matrices = B0, detJ0, B, detJ, detJB
+        return self.B_matrices
+
+    def integrate_material_fast(
+        self,
+        u: Tensor,
+        F: Tensor,
+        stress: Tensor,
+        state: Tensor,
+        n: int,
+        du: Tensor,
+        de0: Tensor,
+        nlgeom: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        """Perform numerical integrations for element stiffness matrix."""
+        # Compute updated configuration
+        u_trial = u[n - 1] + du.view((-1, self.n_dim))
+
+        # Reshape displacement increment
+        du = du.view(-1, self.n_dim)[self.elements].reshape(
+            self.n_elem, -1, self.n_stress
+        )
+
+        # Initialize nodal force and stiffness
+        N_nod = self.etype.nodes
+        weights = self.etype.iweights()
+
+        B0, detJ0, B, detJ, detJB = self.get_B()
+        # TODO: test/fix for nonlinear geometry
+        if nlgeom:
+            # Compute updated gradient operators in deformed configuration
+            shape_functions = [
+                self.eval_shape_functions(xi, u_trial) for xi in self.etype.ipoints()
+            ]
+            B = torch.stack([sf[1] for sf in shape_functions], dim=0)
+            detJ = torch.stack([sf[2] for sf in shape_functions], dim=0)
+
+        # Compute displacement gradient increment
+        H_inc = torch.einsum("...ij,...jk->...ik", B0, du)
+
+        # Update deformation gradient
+        F[n] = F[n - 1] + H_inc
+
+        # Evaluate material response
+        stress[n], state[n], ddsdde = self.material.step(
+            H_inc, F[n - 1], stress[n - 1], state[n - 1], de0
+        )
+
+        # Compute element internal forces
+        force_contrib = self.compute_f(detJ, B, stress[n].clone())
+        f = torch.einsum(
+            "i, ijk -> jk",
+            weights,
+            force_contrib.reshape(N_nod, -1, self.n_dim * N_nod),
+        )
+
+        # Compute element stiffness matrix
+        k = torch.zeros((self.n_elem, self.n_dim * N_nod, self.n_dim * N_nod))
+        if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+            # Material stiffness
+            detJBCB = torch.einsum("nijpq,mnqk,mnil->mnljkp", ddsdde, detJB, B)
+            detJBCB = detJBCB.reshape(N_nod, -1, self.n_dim * N_nod, self.n_dim * N_nod)
+            k += torch.einsum(
+                "i, ijkl -> jkl", weights, self.compute_k_from_detJBCB(detJBCB)
+            )
+        if nlgeom:
+            # TODO: currently not correct -> needs to be fixed
+            # Geometric stiffness
+            degJBSB = torch.einsum(
+                "...iq,...qk,...il->...lk", stress[n].clone(), detJB, B
+            )
+            zeros = torch.zeros_like(degJBSB)
+            kg = torch.stack([degJBSB] + (self.n_dim - 1) * [zeros], dim=-1)
+            kg = kg.reshape(N_nod, -1, N_nod, self.n_dim * N_nod).unsqueeze(-2)
+            zeros = torch.zeros_like(kg)
+            kg = torch.stack([kg] + (self.n_dim - 1) * [zeros], dim=-2)
+            kg = kg.reshape(N_nod, -1, self.n_dim * N_nod, self.n_dim * N_nod)
+            k += torch.einsum("i, ijkl -> jkl", weights, self.compute_k(kg))
+
+        return k, f
+
     def integrate_field(self, field: Tensor | None = None) -> Tensor:
         """Integrate scalar field over elements."""
 
@@ -226,7 +369,7 @@ class FEM(ABC):
         K = torch.empty(size, layout=torch.sparse_coo)
 
         # Build matrix in chunks to prevent excessive memory usage
-        chunks = 4
+        chunks = 1
         for idx, k_chunk in zip(torch.chunk(self.idx, chunks), torch.chunk(k, chunks)):
             # Ravel indices and values
             chunk_size = idx.shape[0]
@@ -253,6 +396,150 @@ class FEM(ABC):
 
         return K.coalesce()
 
+    def get_k_indices_no_constraints(self) -> Tensor:
+        if self.k_indices:
+            return self.k_indices
+
+        size = (self.n_dofs, self.n_dofs)
+
+        # Build matrix in chunks to prevent excessive memory usage
+        idx = self.idx.to(torch.int64)
+
+        # Ravel indices and values
+        col = idx.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        row = idx.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        indices = torch.stack([row, col], dim=0)
+
+        # Sort by row then column for efficient summation
+        linear_indices = indices[0] * size[1] + indices[1]
+        sorted_idx = torch.argsort(linear_indices)
+        sorted_indices = indices[:, sorted_idx]
+
+        # Use torch.unique to sum duplicates
+        unique_linear_idx, inverse_indices = torch.unique(
+            sorted_indices[0] * size[1] + sorted_indices[1], return_inverse=True
+        )
+        self.k_indices = (unique_linear_idx, inverse_indices, sorted_idx)
+
+        return self.k_indices
+
+    def assemble_stiffness_fast_no_constraint_cache(
+        self, k: Tensor
+    ) -> torch.sparse.Tensor:
+        """Assemble global stiffness matrix using fast method."""
+        size = (self.n_dofs, self.n_dofs)
+
+        unique_linear_idx, inverse_indices, sorted_idx = (
+            self.get_k_indices_no_constraints()
+        )
+
+        # Get summed values over indices
+        values = k.ravel()[sorted_idx]
+        summed_values = torch.zeros(
+            len(unique_linear_idx), dtype=k.dtype, device=k.device
+        )
+        summed_values.scatter_add_(0, inverse_indices, values)
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack(
+            [unique_linear_idx // size[1], unique_linear_idx % size[1]]
+        )
+
+        # Eliminate and replace constrained dofs
+        con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
+        mask = ~(
+            torch.isin(unique_linear_idx // size[1], con)
+            | torch.isin(unique_linear_idx % size[1], con)
+        )
+        diag_index = torch.stack((con, con), dim=0)
+        indices = torch.cat(
+            (unique_linear_idx[mask], diag_index[0] * size[1] + diag_index[1])
+        )
+        values = torch.cat(
+            (summed_values[mask], torch.ones_like(con, dtype=k.dtype, device=k.device))
+        )
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack([indices // size[1], indices % size[1]])
+
+        K = torch.sparse_coo_tensor(
+            unique_indices, values, size=size, is_coalesced=True
+        )
+
+        return K
+
+    def get_k_indices(self) -> Tensor:
+        if self.k_indices:
+            return self.k_indices
+
+        size = (self.n_dofs, self.n_dofs)
+
+        # TODO: automatically infer required integer dtype for size[0] * size[1]
+        idx = self.idx.to(torch.int64)
+
+        # Ravel indices and values
+        col = idx.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        row = idx.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        indices = torch.stack([row, col], dim=0)
+
+        # Eliminate and replace constrained dofs
+        con = torch.nonzero(self.constraints.ravel(), as_tuple=False).ravel()
+        ci = torch.isin(idx, con)
+        mask_col = (
+            ci.unsqueeze(1).expand(self.idx.shape[0], self.idx.shape[1], -1).ravel()
+        )
+        mask_row = (
+            ci.unsqueeze(-1).expand(self.idx.shape[0], -1, self.idx.shape[1]).ravel()
+        )
+        mask = ~(mask_col | mask_row)
+        diag_index = torch.stack((con, con), dim=0)
+
+        # Concatenate
+        indices = torch.cat((indices[:, mask], diag_index), dim=1)
+
+        # Sort by row then column for efficient summation
+        linear_indices = indices[0] * size[1] + indices[1]
+        sorted_idx = torch.argsort(linear_indices)
+        sorted_indices = indices[:, sorted_idx]
+
+        # Use torch.unique to sum duplicates
+        unique_linear_idx, inverse_indices = torch.unique(
+            sorted_indices[0] * size[1] + sorted_indices[1], return_inverse=True
+        )
+        self.k_indices = (unique_linear_idx, inverse_indices, sorted_idx, mask)
+
+        return self.k_indices
+
+    def assemble_stiffness_fast(
+        self, k: Tensor, constraint_values: Tensor
+    ) -> torch.sparse.Tensor:
+        """Assemble global stiffness matrix using fast method."""
+        size = (self.n_dofs, self.n_dofs)
+
+        unique_linear_idx, inverse_indices, sorted_idx, constraint_mask = (
+            self.get_k_indices()
+        )
+
+        # Get sorted values
+        values = torch.cat((k.ravel()[constraint_mask], constraint_values), dim=0)
+        sorted_values = values[sorted_idx]
+
+        summed_values = torch.zeros(
+            len(unique_linear_idx), dtype=k.dtype, device=k.device
+        )
+        summed_values.scatter_add_(0, inverse_indices, sorted_values)
+
+        # Convert back to 2D indices
+        unique_indices = torch.stack(
+            [unique_linear_idx // size[1], unique_linear_idx % size[1]]
+        )
+
+        K = torch.sparse_coo_tensor(
+            unique_indices, summed_values, size=size, is_coalesced=True
+        )
+
+        return K
+
     def assemble_force(self, f: Tensor) -> Tensor:
         """Assemble global force vector."""
 
@@ -278,6 +565,7 @@ class FEM(ABC):
         return_intermediate: bool = False,
         aggregate_integration_points: bool = True,
         use_cached_solve: bool = False,
+        use_cached_indices: bool = False,
         nlgeom: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Solve the FEM problem with the Newton-Raphson method.
@@ -338,14 +626,24 @@ class FEM(ABC):
             for i in range(max_iter):
                 du[con] = DU[con]
 
-                # Element-wise integration
-                k, f_i = self.integrate_material(
-                    u, defgrad, stress, state, n, du, de0, nlgeom
-                )
+                if not use_cached_indices:
+                    # Element-wise integration
+                    k, f_i = self.integrate_material(
+                        u, defgrad, stress, state, n, du, de0, nlgeom
+                    )
+                    # Assemble global stiffness matrix and internal force vector (if needed)
+                    if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                        self.K = self.assemble_stiffness(k, con)
+                else:
+                    # Element-wise integration
+                    k, f_i = self.integrate_material_fast(
+                        u, defgrad, stress, state, n, du, de0, nlgeom
+                    )
+                    # Assemble global stiffness matrix and internal force vector (if needed)
+                    if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+                        constraint_values = torch.ones_like(con, dtype=k.dtype)
+                        self.K = self.assemble_stiffness_fast(k, constraint_values)
 
-                # Assemble global stiffness matrix and internal force vector (if needed)
-                if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
-                    self.K = self.assemble_stiffness(k, con)
                 F_int = self.assemble_force(f_i)
 
                 # Compute residual
@@ -359,7 +657,9 @@ class FEM(ABC):
 
                 # Print iteration information
                 if verbose:
-                    print(f"Increment {n} | Iteration {i+1} | Residual: {res_norm:.5e}")
+                    print(
+                        f"Increment {n} | Iteration {i + 1} | Residual: {res_norm:.5e}"
+                    )
 
                 # Check convergence
                 if res_norm < rtol * res_norm0 or res_norm < atol:
