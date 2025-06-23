@@ -14,13 +14,14 @@ class FEM(ABC):
         """Initialize a general FEM problem."""
 
         # Store nodes and elements
-        self.nodes = nodes
-        self.elements = elements
+        self._nodes = nodes
+        self._elements = elements
 
         self.k_indices = None  # Cached indices for stiffness matrix assembly
+        self.B_matrices = None  # Cached B matrices for shape functions
 
         # Compute problem size
-        self.n_dofs = torch.numel(self.nodes)
+        self.n_dofs = torch.numel(nodes)
         self.n_nod = nodes.shape[0]
         self.n_dim = nodes.shape[1]
         self.n_elem = len(self.elements)
@@ -88,6 +89,31 @@ class FEM(ABC):
         self.k_indices = None
 
     @property
+    def elements(self) -> Tensor:
+        """Return the elements of the mesh."""
+        return self._elements
+
+    @elements.setter
+    def elements(self, value: Tensor):
+        """Setter method - called whenever elements are assigned"""
+        # If elements are set/changed, invalidate cached indices
+        self.k_indices = None
+        self.B_matrices = None
+
+    @property
+    def nodes(self) -> Tensor:
+        """Return the nodes of the mesh."""
+        return self._nodes
+
+    @nodes.setter
+    def nodes(self, value: Tensor):
+        """Setter method - called whenever nodes are assigned"""
+        self._nodes = value.to(self.nodes.device)
+        # If nodes are set/changed, invalidate cached indices
+        self.k_indices = None
+        self.B_matrices = None
+
+    @property
     def idx(self) -> Tensor:
         """Return the indices of mesh elements."""
         return self._idx
@@ -107,6 +133,10 @@ class FEM(ABC):
 
     @abstractmethod
     def compute_k(self, detJ: Tensor, BCB: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def compute_k_from_detJBCB(self, detJBCB: Tensor) -> Tensor:
         raise NotImplementedError
 
     @abstractmethod
@@ -216,6 +246,102 @@ class FEM(ABC):
                 kg = torch.stack([kg] + (self.n_dim - 1) * [zeros], dim=-2)
                 kg = kg.reshape(-1, self.n_dim * N_nod, self.n_dim * N_nod)
                 k += w * self.compute_k(detJ, kg)
+
+        return k, f
+
+    def get_B(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Compute the gradient operators for the element."""
+
+        if self.B_matrices:
+            return self.B_matrices
+
+        points = self.etype.ipoints()
+        shape_functions = [self.eval_shape_functions(xi) for xi in points]
+        B0 = torch.stack([sf[1] for sf in shape_functions], dim=0)
+        detJ0 = torch.stack([sf[2] for sf in shape_functions], dim=0)
+        # Use initial gradient operators
+        B = B0
+        detJ = detJ0
+
+        detJB = torch.einsum("...,...jk->...jk", detJ, B)
+
+        self.B_matrices = B0, detJ0, B, detJ, detJB
+        return self.B_matrices
+
+    def integrate_material_fast(
+        self,
+        u: Tensor,
+        F: Tensor,
+        stress: Tensor,
+        state: Tensor,
+        n: int,
+        du: Tensor,
+        de0: Tensor,
+        nlgeom: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        """Perform numerical integrations for element stiffness matrix."""
+        # Compute updated configuration
+        u_trial = u[n - 1] + du.view((-1, self.n_dim))
+
+        # Reshape displacement increment
+        du = du.view(-1, self.n_dim)[self.elements].reshape(
+            self.n_elem, -1, self.n_stress
+        )
+
+        # Initialize nodal force and stiffness
+        N_nod = self.etype.nodes
+        weights = self.etype.iweights()
+
+        B0, detJ0, B, detJ, detJB = self.get_B()
+        # TODO: test/fix for nonlinear geometry
+        if nlgeom:
+            # Compute updated gradient operators in deformed configuration
+            shape_functions = [
+                self.eval_shape_functions(xi, u_trial) for xi in self.etype.ipoints()
+            ]
+            B = torch.stack([sf[1] for sf in shape_functions], dim=0)
+            detJ = torch.stack([sf[2] for sf in shape_functions], dim=0)
+
+        # Compute displacement gradient increment
+        H_inc = torch.einsum("...ij,...jk->...ik", B0, du)
+
+        # Update deformation gradient
+        F[n] = F[n - 1] + H_inc
+
+        # Evaluate material response
+        stress[n], state[n], ddsdde = self.material.step(
+            H_inc, F[n - 1], stress[n - 1], state[n - 1], de0
+        )
+
+        # Compute element internal forces
+        force_contrib = self.compute_f(detJ, B, stress[n].clone())
+        f = torch.einsum(
+            "i, ijk -> jk",
+            weights,
+            force_contrib.reshape(N_nod, -1, self.n_dim * N_nod),
+        )
+
+        # Compute element stiffness matrix
+        if self.K.numel() == 0 or not self.material.n_state == 0 or nlgeom:
+            # Material stiffness
+            detJBCB = torch.einsum("nijpq,mnqk,mnil->mnljkp", ddsdde, detJB, B)
+            detJBCB = detJBCB.reshape(N_nod, -1, self.n_dim * N_nod, self.n_dim * N_nod)
+            k = torch.einsum(
+                "i, ijkl -> jkl", weights, self.compute_k_from_detJBCB(detJBCB)
+            )
+        if nlgeom:
+            # TODO: currently not correct -> needs to be fixed
+            # Geometric stiffness
+            degJBSB = torch.einsum(
+                "...iq,...qk,...il->...lk", stress[n].clone(), detJB, B
+            )
+            zeros = torch.zeros_like(degJBSB)
+            kg = torch.stack([degJBSB] + (self.n_dim - 1) * [zeros], dim=-1)
+            kg = kg.reshape(N_nod, -1, N_nod, self.n_dim * N_nod).unsqueeze(-2)
+            zeros = torch.zeros_like(kg)
+            kg = torch.stack([kg] + (self.n_dim - 1) * [zeros], dim=-2)
+            kg = kg.reshape(N_nod, -1, self.n_dim * N_nod, self.n_dim * N_nod)
+            k += torch.einsum("i, ijkl -> jkl", weights, self.compute_k(kg))
 
         return k, f
 

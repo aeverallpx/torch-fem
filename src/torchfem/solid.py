@@ -50,6 +50,10 @@ class Solid(FEM):
         """Element stiffness matrix"""
         return torch.einsum("j,jkl->jkl", detJ, BCB)
 
+    def compute_k_from_detJBCB(self, detJBCB: Tensor) -> Tensor:
+        """Element stiffness matrix"""
+        return detJBCB
+
     def compute_f(self, detJ: Tensor, B: Tensor, S: Tensor) -> Tensor:
         """Element internal force vector."""
         return torch.einsum("...,...ik,...ij->...kj", detJ, B, S)
